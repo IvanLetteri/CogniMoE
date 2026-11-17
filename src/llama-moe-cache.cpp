@@ -666,6 +666,9 @@ struct llama_moe_cache::impl {
                                         prewarmed_bytes += expert_size;
                                     }
                                 }
+                                for (const auto & f : fills) {
+                                    CogniMoETelemetry::instance().set_vram_resident(il, f.expert, true);
+                                }
                                 prewarmed_count += fills.size();
                             }
                         }

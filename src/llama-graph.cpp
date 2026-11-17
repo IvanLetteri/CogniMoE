@@ -3,6 +3,7 @@
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "cognimoe-telemetry.h"
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
@@ -2297,6 +2298,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
+    }
+
+    // CogniMoE: Cache-Aware Soft-Masking sui Logit (pre-Softmax)
+    if (selected_experts_in == nullptr && CogniMoETelemetry::instance().is_soft_mask_active() && n_tokens > 0) {
+        ggml_tensor * cache_bias = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
+        ggml_set_name(cache_bias, "cognimoe_cache_bias");
+        CogniMoETelemetry::instance().register_bias_tensor(il, cache_bias);
+        logits = ggml_add(ctx0, logits, cache_bias);
+        cb(logits, "ffn_moe_logits_cognimoe_masked", il);
     }
 
     ggml_tensor * probs = nullptr;

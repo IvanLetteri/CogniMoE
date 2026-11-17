@@ -10,7 +10,6 @@ import pynvml
 from sentence_transformers import SentenceTransformer
 from mabwiser.mab import MAB, LearningPolicy, NeighborhoodPolicy
 
-# --- CONFIGURAZIONE PAGINA ---
 st.set_page_config(page_title="CogniMoE Supervisor", page_icon="🧠", layout="wide")
 st.title("🧠 CogniMoE: Cognitive Expert Routing & VRAM Orchestrator")
 
@@ -19,7 +18,6 @@ BIN_PATH = "./build/bin/llama-completion"
 WIKI_DIR = "cognimoe_wiki"
 HISTORY_FILE = os.path.join(WIKI_DIR, "bandit_history.json")
 
-# --- TELEMETRIA GPU (PYNVML) ---
 @st.cache_resource
 def init_nvml():
     try:
@@ -45,7 +43,6 @@ def get_gpu_telemetry():
         }
     return stats
 
-# --- MOTORE EMBEDDING SU CPU (ZERO VRAM) ---
 @st.cache_resource
 def load_embedder():
     return SentenceTransformer("all-MiniLM-L6-v2", device="cpu")
@@ -53,12 +50,10 @@ def load_embedder():
 embedder = load_embedder()
 
 def build_context_vector(text: str, cache_mib: float) -> np.ndarray:
-    """Costruisce il vettore di stato normalizzato (384 dim embedding + cache_gb)."""
     emb = embedder.encode([text], normalize_embeddings=True).flatten()
     cache_gb = np.array([cache_mib / 1024.0], dtype=np.float32)
     return np.concatenate([emb, cache_gb])
 
-# --- DEFINIZIONE AZIONI / PROFILI DELLA WIKI ---
 PROFILES = {
     "AUTO_COLD (No Pre-Warming)": None,
     "SKILL_CODING (Top-66 Code Experts)": os.path.join(WIKI_DIR, "profile_coding.json"),
@@ -67,7 +62,6 @@ PROFILES = {
     "SKILL_REASONING (Top-66 Logic Experts)": os.path.join(WIKI_DIR, "profile_reasoning.json"),
 }
 
-# --- INIZIALIZZAZIONE AGENTE RL (CONTEXTUAL BANDIT) ---
 def init_bandit():
     bandit = MAB(
         arms=list(PROFILES.keys()),
@@ -102,7 +96,7 @@ def init_bandit():
             for ex in examples:
                 vecs.append(build_context_vector(ex, 4800.0))
                 arms.append(arm_name)
-                rewards.append(35.0)
+                rewards.append(38.0)
     vecs.append(build_context_vector("Generic short greeting hello", 4800.0))
     arms.append("AUTO_COLD (No Pre-Warming)")
     rewards.append(25.0)
@@ -118,7 +112,6 @@ if "bandit" not in st.session_state:
     else:
         st.session_state.history = []
 
-# --- SIDEBAR: TOPOLOGIA HARDWARE & CONTROLLO MANUALE ---
 st.sidebar.header("🖥️ Hardware & Offloading Nodes")
 gpu_stats = get_gpu_telemetry()
 for dev, info in gpu_stats.items():
@@ -141,6 +134,11 @@ cpu_miss_share = st.sidebar.slider(
     min_value=0.0, max_value=1.0, value=0.8, step=0.1,
     help="0.0 = carica tutto su GPU via PCIe; 0.8 = preserva gli esperti pre-caricati calcolando i miss rari su CPU."
 )
+soft_mask_penalty = st.sidebar.slider(
+    "Cache-Aware Soft-Masking Penalty (Logits):",
+    min_value=0.0, max_value=0.60, value=0.25, step=0.05,
+    help="Penalizza leggermente i logit degli esperti fuori dalla VRAM per abbattere il traffico sul bus PCIe."
+)
 
 rpc_nodes = st.sidebar.text_input("Nodi Android RPC (es. 192.168.1.50:50052):", value="", placeholder="Opzionale (futuro)")
 
@@ -151,7 +149,6 @@ if st.sidebar.button("🗑️ Resetta Memoria Bandit"):
         os.remove(HISTORY_FILE)
     st.rerun()
 
-# --- TABS PRINCIPALI ---
 tab_infer, tab_heatmap, tab_wiki = st.tabs(["⚡ Inferenza & Routing RL", "🔥 Mappa Termica Esperti (40x256)", "📚 LLM Wiki (Second Brain)"])
 
 with tab_infer:
@@ -168,24 +165,22 @@ with tab_infer:
             chosen_arm = manual_profile
 
         prewarm_file = PROFILES[chosen_arm]
-        st.info(f"**Strategia Attiva:** `{chosen_arm}` | **Cache VRAM:** `{cache_mib} MiB` | **CPU Miss Share:** `{cpu_miss_share}`")
+        st.info(f"**Strategia:** `{chosen_arm}` | **Cache VRAM:** `{cache_mib} MiB` | **Soft-Masking:** `{soft_mask_penalty}`")
 
         env = os.environ.copy()
         if prewarm_file and os.path.exists(prewarm_file):
             env["COGNIMOE_PREWARM_JSON"] = prewarm_file
+            env["COGNIMOE_CACHE_MISS_PENALTY"] = str(soft_mask_penalty)
         else:
             env.pop("COGNIMOE_PREWARM_JSON", None)
-
-        live_telemetry_out = os.path.join(WIKI_DIR, "last_run_telemetry.json")
-        env["COGNIMOE_TELEMETRY_OUT"] = live_telemetry_out
+            env.pop("COGNIMOE_CACHE_MISS_PENALTY", None)
 
         cmd = [
             BIN_PATH, "-m", MODEL_PATH,
             "--cpu-moe",
             "--moe-cache-mib", str(cache_mib),
             "--moe-cache-cpu-share", str(cpu_miss_share),
-            "-no-cnv",
-            "--verbose",
+            "-no-cnv", "--verbose",
             "-n", str(max_tokens),
             "-p", prompt
         ]
@@ -193,32 +188,25 @@ with tab_infer:
             cmd.extend(["--rpc", rpc_nodes.strip()])
 
         with st.spinner("Caricamento esperti in VRAM ed esecuzione grafo C++..."):
-            t0 = time.time()
             proc = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True)
-            elapsed = time.time() - t0
 
         full_logs = proc.stdout + "\n" + proc.stderr
 
-        # Estrazione robusta della velocità di generazione
         gen_tps = 0.0
         eval_match = re.search(r"eval time =\s+[\d.,]+\s+ms\s+/\s+\d+\s+runs\s+\(\s+[\d.,]+\s+ms per token,\s+([\d.,]+)\s+tokens per second\)", full_logs)
         if eval_match:
             gen_tps = float(eval_match.group(1).replace(",", "."))
-        else:
-            bar_match = re.search(r"Generation:\s+([\d.,]+)\s+t/s", full_logs)
-            if bar_match:
-                gen_tps = float(bar_match.group(1).replace(",", "."))
 
         hit_match = re.search(r"ubatch <= 8:.*hit rate = ([\d.,]+)%", full_logs)
         hit_rate = float(hit_match.group(1).replace(",", ".")) if hit_match else 0.0
 
-        # Calcolo Ricompensa (Reward) e Aggiornamento Online del Bandit
         reward = round(gen_tps + (hit_rate * 0.1), 2) if proc.returncode == 0 else -10.0
         st.session_state.bandit.partial_fit(decisions=[chosen_arm], rewards=[reward], contexts=context_vec)
 
         record = {
             "Prompt": prompt[:48] + ("..." if len(prompt) > 48 else ""),
             "Azione Scelta": chosen_arm,
+            "Soft-Mask": soft_mask_penalty,
             "Gen Speed (t/s)": gen_tps,
             "VRAM Hit Rate (%)": hit_rate,
             "Reward RL": reward
@@ -245,7 +233,7 @@ with tab_infer:
 
 with tab_heatmap:
     st.subheader("Distribuzione Attivazione Esperti (40 Layer x 256 Esperti)")
-    json_files = [f for f in os.listdir(WIKI_DIR) if f.endswith(".json") and "bandit" not in f]
+    json_files = [f for f in os.listdir(WIKI_DIR) if f.endswith(".json") and "bandit" not in f and "last_" not in f]
     selected_json = st.selectbox("Seleziona profilo telemetrico da ispezionare:", json_files)
     if selected_json:
         with open(os.path.join(WIKI_DIR, selected_json)) as f:
