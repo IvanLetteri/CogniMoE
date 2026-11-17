@@ -1,4 +1,5 @@
 #include "llama-moe-cache.h"
+#include "cognimoe-telemetry.h"
 
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -631,6 +632,46 @@ struct llama_moe_cache::impl {
                     LLAMA_LOG_INFO("%s: %2zu layers, %s: %5d slots (%.1f%%, %.1f tokens worth)\n", __func__,
                         g.layers.size(), ggml_type_name(g.ref.back()->type), g.n_slots, 100.0*g.n_slots/(g.layers.size()*g.ref[0]->ne[2]),
                         (double) g.n_slots/(g.layers.size()*n_expert_used));
+                }
+            }
+        }
+
+        // CogniMoE: Pre-Warming predittivo della VRAM da file cognitivo / telemetria
+        if (!no_alloc) {
+            if (const char * prewarm_path = std::getenv("COGNIMOE_PREWARM_JSON")) {
+                int total_layers = (int) layers.size();
+                int total_experts = total_layers > 0 && !layers[0].experts.empty() ? (int) layers[0].experts[0]->ne[2] : 0;
+                if (total_layers > 0 && total_experts > 0) {
+                    // Calcola il budget medio di slot per layer disponibile su questo dispositivo
+                    int k_per_layer = !groups.empty() && !groups[0].layers.empty() ? (groups[0].n_slots / (int) groups[0].layers.size()) : 32;
+                    auto top_experts = cognimoe_load_top_experts_from_json(prewarm_path, total_layers, total_experts, k_per_layer);
+                    if (!top_experts.empty()) {
+                        size_t prewarmed_count = 0;
+                        size_t prewarmed_bytes = 0;
+                        for (group & g : groups) {
+                            ggml_backend_t dev_backend = devices[g.id].backend;
+                            if (!dev_backend) continue;
+                            for (int32_t il : g.layers) {
+                                if (il >= (int32_t) top_experts.size() || top_experts[il].empty()) continue;
+                                layer & l = layers[il];
+                                size_t dummy_hit = 0;
+                                g.lru.plan(il, top_experts[il].data(), top_experts[il].size(), 1, (int32_t) top_experts[il].size(), 0,
+                                    [](size_t) -> size_t { return 0; }, fills, cpu, dummy_hit);
+                                for (size_t ip = 0; ip < l.experts.size(); ++ip) {
+                                    const ggml_tensor * w = l.experts[ip];
+                                    ggml_tensor * bank = g.banks[ip];
+                                    const size_t expert_size = w->nb[2];
+                                    for (const auto & f : fills) {
+                                        ggml_backend_tensor_set(bank, (const uint8_t *) w->data + f.expert * expert_size, f.slot * expert_size, expert_size);
+                                        prewarmed_bytes += expert_size;
+                                    }
+                                }
+                                prewarmed_count += fills.size();
+                            }
+                        }
+                        LLAMA_LOG_INFO("CogniMoE Pre-Warming: caricati %zu esperti (%.2f MiB) in VRAM da '%s' prima del primo token\n",
+                            prewarmed_count, prewarmed_bytes / (1024.0 * 1024.0), prewarm_path);
+                    }
                 }
             }
         }

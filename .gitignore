@@ -153,3 +153,8 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+# CogniMoE temporary profiling files
+telemetry_*.json
+ot_*.args
+*.bak

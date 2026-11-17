@@ -10,6 +10,7 @@
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
+#include "cognimoe-telemetry.h"
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
@@ -229,6 +230,11 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    if (cparams.cb_eval == nullptr && hparams.n_expert > 0) {
+        CogniMoETelemetry::instance().init(hparams.n_layer(), hparams.n_expert);
+        cparams.cb_eval = CogniMoETelemetry::eval_callback;
+    }
 
     cparams.ctx_other = nullptr;
 
@@ -633,6 +639,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (const char * telemetry_out = std::getenv("COGNIMOE_TELEMETRY_OUT")) {
+        CogniMoETelemetry::instance().export_json(telemetry_out);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.no_alloc() && !opt_ctx) {
