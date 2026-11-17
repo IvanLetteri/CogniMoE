@@ -158,3 +158,6 @@ AGENTS.local.md
 telemetry_*.json
 ot_*.args
 *.bak
+.venv_cognimoe/
+cognimoe_wiki/last_run_telemetry.json
+cognimoe_wiki/bandit_history.json
